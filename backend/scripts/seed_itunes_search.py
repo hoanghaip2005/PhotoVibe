@@ -524,8 +524,13 @@ async def run(args: argparse.Namespace) -> None:
         if not docs:
             finish_job(job_id, "completed", 0, 0, 0)
             return
-        await embed_documents(docs, args.embedding_batch_size, args.embedding_model)
-        imported = insert_documents(docs, args.insert_batch_size)
+        await embed_documents(
+            docs,
+            args.embedding_batch_size,
+            args.embedding_model,
+            args.embedding_dimension,
+        )
+        imported = insert_documents(docs, args.insert_batch_size, args.embedding_model)
         total_after, embedded_after = count_songs()
         print(f"after songs={total_after} embedded={embedded_after}", flush=True)
         finish_job(job_id, "completed", imported, max(0, len(docs) - imported), 0)
@@ -547,7 +552,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--insert-batch-size", type=int, default=250)
     parser.add_argument(
         "--embedding-model",
-        default=ENV.get("OPENAI_EMBEDDING_MODEL") or "text-embedding-3-small",
+        default=ENV.get("EMBEDDING_MODEL")
+        or ENV.get("OPENAI_EMBEDDING_MODEL")
+        or "text-embedding-3-small",
+    )
+    parser.add_argument(
+        "--embedding-dimension",
+        type=int,
+        default=int(ENV.get("EMBEDDING_DIMENSION") or 768),
     )
     parser.add_argument("--explicit", choices=("Yes", "No"), default="No")
     parser.add_argument("--dry-run", action="store_true")

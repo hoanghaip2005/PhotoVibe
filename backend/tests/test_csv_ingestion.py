@@ -7,8 +7,10 @@ def _service() -> SpotifyIngestionService:
         settings=Settings(),
         spotify=object(),  # type: ignore[arg-type]
         openai=object(),  # type: ignore[arg-type]
+        embeddings=object(),  # type: ignore[arg-type]
         songs=object(),  # type: ignore[arg-type]
         supabase=object(),  # type: ignore[arg-type]
+        usage=object(),  # type: ignore[arg-type]
     )
 
 

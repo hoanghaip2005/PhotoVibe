@@ -5,6 +5,8 @@ FastAPI backend for the production VibeLens flow:
 - Runtime `/analyze` accepts an image, calls OpenAI vision, searches Supabase Postgres pgvector `songs`, reranks by music profile, and returns a `VibeResult`.
 - Spotify API is used only by admin ingestion endpoints. Runtime recommendations
   are read from Supabase pgvector, never scraped live from Spotify.
+- Runtime `/analyze` embeds only the AI-generated `playlistQuery` once per request.
+  Song embeddings are generated only by admin ingestion or explicit regeneration.
 - Supabase stores app data: profiles, preferences, results, generated playlists, playlist songs, filters, usage, and ingestion jobs.
 - Flutter must not contain OpenAI, Spotify client secret, Supabase DB URL, or Supabase service role keys.
 
@@ -27,6 +29,18 @@ beta can currently trip FastAPI/Pydantic typing internals.
 Fill `.env` with OpenAI, `SUPABASE_DB_URL` for pgvector, optional Supabase REST
 keys, Spotify client credentials, and `ADMIN_INGESTION_TOKEN`.
 
+Embedding controls:
+
+```powershell
+AI_PROVIDER=openai
+EMBEDDING_PROVIDER=openai
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSION=768
+MAX_RUNTIME_EMBEDDING_CALLS_PER_ANALYZE=1
+ENABLE_SONG_EMBEDDING_IN_RUNTIME=false
+ALLOW_EMBEDDING_REGENERATION=false
+```
+
 ## Endpoints
 
 - `POST /analyze`
@@ -39,6 +53,9 @@ keys, Spotify client credentials, and `ADMIN_INGESTION_TOKEN`.
 - `POST /filters`
 - `POST /admin/ingest-spotify-playlist`
 - `POST /admin/ingest-songs-csv`
+
+Use `regenerateEmbedding=true` only with `ALLOW_EMBEDDING_REGENERATION=true` when
+an admin intentionally wants to replace stored song embeddings.
 
 Runtime `/analyze` does not call Spotify.
 

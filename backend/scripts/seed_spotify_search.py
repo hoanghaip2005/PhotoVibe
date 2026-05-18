@@ -174,6 +174,12 @@ def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
 
 
+def normalized_key(title: str, artist: str) -> str:
+    value = f"{title}-{artist}".lower()
+    normalized = "".join(character if character.isalnum() else "-" for character in value)
+    return "-".join(part for part in normalized.split("-") if part) or "song"
+
+
 def age_affinity() -> dict[str, float]:
     return {
         "teen": 0.5,
@@ -427,6 +433,7 @@ async def embed_documents(
     docs: list[TrackDocument],
     batch_size: int,
     model: str,
+    dimensions: int,
 ) -> None:
     client = AsyncOpenAI(api_key=env_required("OPENAI_API_KEY"))
     total_batches = math.ceil(len(docs) / batch_size)
@@ -436,7 +443,11 @@ async def embed_documents(
         inputs = [doc.vibe_description for doc in batch]
         for attempt in range(6):
             try:
-                response = await client.embeddings.create(model=model, input=inputs)
+                response = await client.embeddings.create(
+                    model=model,
+                    input=inputs,
+                    dimensions=dimensions,
+                )
                 break
             except RateLimitError:
                 if attempt == 5:
@@ -447,7 +458,12 @@ async def embed_documents(
                     raise
                 await asyncio.sleep(2 + 2 * attempt)
         for doc, item in zip(batch, response.data, strict=True):
-            doc.embedding = list(item.embedding)
+            embedding = list(item.embedding)
+            if len(embedding) != dimensions:
+                raise RuntimeError(
+                    f"embedding dimension mismatch: got {len(embedding)}, expected {dimensions}"
+                )
+            doc.embedding = embedding
         print(
             f"embedded_batch={batch_index + 1}/{total_batches} "
             f"embedded={min(start + len(batch), len(docs))}/{len(docs)}",
@@ -455,13 +471,14 @@ async def embed_documents(
         )
 
 
-def insert_documents(docs: list[TrackDocument], batch_size: int) -> int:
+def insert_documents(docs: list[TrackDocument], batch_size: int, embedding_model: str) -> int:
     statement = """
         insert into songs (
           song_id,
           track_id,
           title,
           artist,
+          normalized_key,
           spotify_url,
           spotify_search_url,
           album,
@@ -479,13 +496,16 @@ def insert_documents(docs: list[TrackDocument], batch_size: int) -> int:
           popularity_tier,
           vibe_description,
           embedding,
+          embedding_model,
+          embedding_created_at,
+          source,
           ingested_at
         )
         values (
           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-          %s, %s, %s, %s::vector, %s
+          %s, %s, %s, %s, %s::vector, %s, %s, %s, %s
         )
-        on conflict (song_id) do nothing
+        on conflict (normalized_key) do nothing
     """
     inserted = 0
     with db_connect() as connection:
@@ -504,6 +524,7 @@ def insert_documents(docs: list[TrackDocument], batch_size: int) -> int:
                             doc.track_id,
                             doc.title,
                             doc.artist,
+                            normalized_key(doc.title, doc.artist),
                             doc.spotify_url or None,
                             doc.spotify_search_url,
                             doc.album,
@@ -521,6 +542,9 @@ def insert_documents(docs: list[TrackDocument], batch_size: int) -> int:
                             doc.popularity_tier,
                             doc.vibe_description,
                             vector_literal(doc.embedding),
+                            embedding_model,
+                            datetime.now(UTC).isoformat(),
+                            "spotify_ingestion",
                             datetime.now(UTC).isoformat(),
                         )
                     )
@@ -557,8 +581,13 @@ async def run(args: argparse.Namespace) -> None:
         if args.dry_run:
             finish_job(job_id, "completed", 0, len(docs), 0)
             return
-        await embed_documents(docs, args.embedding_batch_size, args.embedding_model)
-        imported = insert_documents(docs, args.insert_batch_size)
+        await embed_documents(
+            docs,
+            args.embedding_batch_size,
+            args.embedding_model,
+            args.embedding_dimension,
+        )
+        imported = insert_documents(docs, args.insert_batch_size, args.embedding_model)
         total_after, embedded_after = count_songs()
         print(f"after songs={total_after} embedded={embedded_after}", flush=True)
         finish_job(job_id, "completed", imported, max(0, len(docs) - imported), 0)
@@ -579,7 +608,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--insert-batch-size", type=int, default=250)
     parser.add_argument(
         "--embedding-model",
-        default=ENV.get("OPENAI_EMBEDDING_MODEL") or "text-embedding-3-small",
+        default=ENV.get("EMBEDDING_MODEL")
+        or ENV.get("OPENAI_EMBEDDING_MODEL")
+        or "text-embedding-3-small",
+    )
+    parser.add_argument(
+        "--embedding-dimension",
+        type=int,
+        default=int(ENV.get("EMBEDDING_DIMENSION") or 768),
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()

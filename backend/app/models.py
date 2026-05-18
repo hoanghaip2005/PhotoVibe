@@ -155,6 +155,7 @@ class IngestSpotifyPlaylistRequest(BaseModel):
     regenerate_vibe_description: bool = Field(
         default=False, alias="regenerateVibeDescription"
     )
+    regenerate_embedding: bool = Field(default=False, alias="regenerateEmbedding")
 
     model_config = {"populate_by_name": True}
 
@@ -162,6 +163,8 @@ class IngestSpotifyPlaylistRequest(BaseModel):
 class IngestionResponse(BaseModel):
     imported: int
     skipped_duplicates: int = Field(alias="skippedDuplicates")
+    skipped_existing_embedding: int = Field(default=0, alias="skippedExistingEmbedding")
+    regenerated_embeddings: int = Field(default=0, alias="regeneratedEmbeddings")
     failed: int
     collection: str
 

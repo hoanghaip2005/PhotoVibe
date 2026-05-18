@@ -287,42 +287,6 @@ class OpenAIVibeService:
                 details=str(exc),
             ) from exc
 
-    async def embed_text(self, text: str) -> list[float]:
-        client = self._ensure_configured()
-        try:
-            response = await client.embeddings.create(
-                model=self.settings.openai_embedding_model,
-                input=text,
-            )
-        except RateLimitError as exc:
-            raise AppError(
-                "OPENAI_QUOTA_EXCEEDED",
-                "OpenAI quota is exhausted or billing is not enabled for this project.",
-                status_code=429,
-                details=self._openai_error_detail(exc),
-            ) from exc
-        except APIConnectionError as exc:
-            raise AppError(
-                "OPENAI_CONNECTION_FAILED",
-                "Could not connect to OpenAI embeddings.",
-                status_code=502,
-                details=str(exc)[:300],
-            ) from exc
-        except APIStatusError as exc:
-            raise AppError(
-                "OPENAI_EMBEDDING_FAILED",
-                "OpenAI rejected the embedding request.",
-                status_code=502,
-                details=self._openai_error_detail(exc),
-            ) from exc
-        if not response.data:
-            raise AppError(
-                "EMBEDDING_FAILED",
-                "OpenAI did not return an embedding.",
-                status_code=502,
-            )
-        return list(response.data[0].embedding)
-
     def _parse_vision_json(self, text: str) -> VisionVibe:
         try:
             raw = json.loads(self._strip_code_fence(text))

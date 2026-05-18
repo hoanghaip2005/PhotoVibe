@@ -25,6 +25,7 @@ async def ingest_spotify_playlist(
         playlist_ids=request.playlist_ids,
         limit_per_playlist=request.limit_per_playlist,
         regenerate_vibe_description=request.regenerate_vibe_description,
+        regenerate_embedding=request.regenerate_embedding,
     )
 
 
@@ -37,6 +38,7 @@ async def ingest_songs_csv(
     service: Annotated[SpotifyIngestionService, Depends(ingestion_service_dep)],
     file: UploadFile = File(...),
     regenerateVibeDescription: bool = False,
+    regenerateEmbedding: bool = False,
 ) -> IngestionResponse:
     raw = (await file.read()).decode("utf-8-sig")
     rows = [
@@ -53,4 +55,5 @@ async def ingest_songs_csv(
     return await service.ingest_csv_rows(
         rows,
         regenerate_vibe_description=regenerateVibeDescription,
+        regenerate_embedding=regenerateEmbedding,
     )

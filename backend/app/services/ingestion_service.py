@@ -8,6 +8,8 @@ from ..config import Settings
 from ..models import IngestionResponse
 from ..repositories.pgvector import SupabaseVectorSongRepository
 from ..repositories.supabase import SupabaseRepository
+from ..repositories.usage_repository import EmbeddingUsageRepository
+from .embedding_service import EmbeddingService
 from .openai_service import OpenAIVibeService
 from .spotify_service import SpotifyClient
 
@@ -18,25 +20,32 @@ class SpotifyIngestionService:
         settings: Settings,
         spotify: SpotifyClient,
         openai: OpenAIVibeService,
+        embeddings: EmbeddingService,
         songs: SupabaseVectorSongRepository,
         supabase: SupabaseRepository,
+        usage: EmbeddingUsageRepository,
     ) -> None:
         self.settings = settings
         self.spotify = spotify
         self.openai = openai
+        self.embeddings = embeddings
         self.songs = songs
         self.supabase = supabase
+        self.usage = usage
 
     async def ingest_playlists(
         self,
         playlist_ids: list[str],
         limit_per_playlist: int,
         regenerate_vibe_description: bool,
+        regenerate_embedding: bool = False,
         admin_user_id: str | None = None,
     ) -> IngestionResponse:
         job_id = await self._start_job("spotify", playlist_ids, admin_user_id)
         imported = 0
-        skipped = 0
+        skipped_duplicates = 0
+        skipped_existing_embedding = 0
+        regenerated_embeddings = 0
         failed = 0
         try:
             seen: set[str] = set()
@@ -47,14 +56,18 @@ class SpotifyIngestionService:
                     if not normalized:
                         failed += 1
                         continue
-                    key = normalized["song_id"]
+                    key = self._dedupe_key(normalized)
                     if key in seen:
-                        skipped += 1
+                        skipped_duplicates += 1
                         continue
                     seen.add(key)
-                    existing = await self.songs.find_by_song_id(key)
-                    if existing and not regenerate_vibe_description:
-                        skipped += 1
+                    existing = await self._find_existing_song(normalized)
+                    if self._has_existing_embedding(existing):
+                        if not self._can_regenerate_embedding(regenerate_embedding):
+                            skipped_existing_embedding += 1
+                            continue
+                        await self._regenerate_existing_embedding(existing, admin_user_id)
+                        regenerated_embeddings += 1
                         continue
                     try:
                         metadata = await self.openai.tag_song(
@@ -65,22 +78,26 @@ class SpotifyIngestionService:
                             playlist_context=playlist_id,
                         )
                         document = self._song_document(normalized, metadata)
-                        await self._attach_embedding(document)
+                        await self._attach_embedding(document, admin_user_id)
                         inserted = await self.songs.upsert_song(
                             document,
-                            replace_existing=regenerate_vibe_description,
+                            replace_existing=bool(existing) or regenerate_vibe_description,
                         )
                         imported += 1 if inserted else 0
-                        skipped += 0 if inserted else 1
+                        skipped_duplicates += 0 if inserted else 1
                     except Exception:
                         failed += 1
-            await self._finish_job(job_id, "completed", imported, skipped, failed)
+            skipped_total = skipped_duplicates + skipped_existing_embedding
+            await self._finish_job(job_id, "completed", imported, skipped_total, failed)
         except Exception as exc:
-            await self._finish_job(job_id, "failed", imported, skipped, failed, str(exc))
+            skipped_total = skipped_duplicates + skipped_existing_embedding
+            await self._finish_job(job_id, "failed", imported, skipped_total, failed, str(exc))
             raise
         return IngestionResponse(
             imported=imported,
-            skippedDuplicates=skipped,
+            skippedDuplicates=skipped_duplicates,
+            skippedExistingEmbedding=skipped_existing_embedding,
+            regeneratedEmbeddings=regenerated_embeddings,
             failed=failed,
             collection=self.settings.song_collection,
         )
@@ -89,25 +106,32 @@ class SpotifyIngestionService:
         self,
         rows: list[dict[str, str]],
         regenerate_vibe_description: bool = False,
+        regenerate_embedding: bool = False,
         admin_user_id: str | None = None,
     ) -> IngestionResponse:
         job_id = await self._start_job("csv", [], admin_user_id)
         imported = 0
-        skipped = 0
+        skipped_duplicates = 0
+        skipped_existing_embedding = 0
+        regenerated_embeddings = 0
         failed = 0
         try:
             seen: set[str] = set()
             for row in rows:
                 try:
                     normalized = self._csv_track_document(row)
-                    key = normalized["song_id"]
+                    key = self._dedupe_key(normalized)
                     if key in seen:
-                        skipped += 1
+                        skipped_duplicates += 1
                         continue
                     seen.add(key)
-                    existing = await self.songs.find_by_song_id(key)
-                    if existing and not regenerate_vibe_description:
-                        skipped += 1
+                    existing = await self._find_existing_song(normalized)
+                    if self._has_existing_embedding(existing):
+                        if not self._can_regenerate_embedding(regenerate_embedding):
+                            skipped_existing_embedding += 1
+                            continue
+                        await self._regenerate_existing_embedding(existing, admin_user_id)
+                        regenerated_embeddings += 1
                         continue
 
                     metadata = self._csv_metadata(row)
@@ -121,22 +145,26 @@ class SpotifyIngestionService:
                         )
                         metadata = self._merge_metadata(generated, metadata)
                     document = self._song_document(normalized, metadata)
-                    await self._attach_embedding(document)
+                    await self._attach_embedding(document, admin_user_id)
                     inserted = await self.songs.upsert_song(
                         document,
-                        replace_existing=regenerate_vibe_description,
+                        replace_existing=bool(existing) or regenerate_vibe_description,
                     )
                     imported += 1 if inserted else 0
-                    skipped += 0 if inserted else 1
+                    skipped_duplicates += 0 if inserted else 1
                 except Exception:
                     failed += 1
-            await self._finish_job(job_id, "completed", imported, skipped, failed)
+            skipped_total = skipped_duplicates + skipped_existing_embedding
+            await self._finish_job(job_id, "completed", imported, skipped_total, failed)
         except Exception as exc:
-            await self._finish_job(job_id, "failed", imported, skipped, failed, str(exc))
+            skipped_total = skipped_duplicates + skipped_existing_embedding
+            await self._finish_job(job_id, "failed", imported, skipped_total, failed, str(exc))
             raise
         return IngestionResponse(
             imported=imported,
-            skippedDuplicates=skipped,
+            skippedDuplicates=skipped_duplicates,
+            skippedExistingEmbedding=skipped_existing_embedding,
+            regeneratedEmbeddings=regenerated_embeddings,
             failed=failed,
             collection=self.settings.song_collection,
         )
@@ -163,14 +191,64 @@ class SpotifyIngestionService:
             "popularity_tier": metadata.get("popularity_tier") or "unknown",
             "vibe_description": vibe_description,
             "$vectorize": vibe_description,
+            "normalized_key": self._normalized_key(normalized["title"], normalized["artist"]),
             "ingested_at": datetime.now(UTC).isoformat(),
         }
 
-    async def _attach_embedding(self, document: dict[str, Any]) -> None:
+    async def _attach_embedding(
+        self,
+        document: dict[str, Any],
+        admin_user_id: str | None,
+    ) -> None:
         source_text = document.get("vibe_description") or document.get("$vectorize")
         if not source_text:
-            source_text = f"{document.get('title', '')} {document.get('artist', '')}".strip()
-        document["embedding"] = await self.openai.embed_text(source_text)
+            raise ValueError("Song embedding requires vibe_description.")
+        document["embedding"] = await self.embeddings.embed_text(source_text)
+        document["embedding_model"] = getattr(
+            self.embeddings,
+            "model",
+            self.settings.embedding_model,
+        )
+        document["embedding_created_at"] = datetime.now(UTC).isoformat()
+        await self.usage.log_embedding_call(
+            operation="embedding",
+            context="song_ingestion",
+            model=document["embedding_model"],
+            input_text_count=1,
+            user_id=admin_user_id,
+        )
+
+    async def _regenerate_existing_embedding(
+        self,
+        existing: dict[str, Any] | None,
+        admin_user_id: str | None,
+    ) -> None:
+        if not existing:
+            return
+        document = dict(existing)
+        document["normalized_key"] = document.get("normalized_key") or self._normalized_key(
+            str(document.get("title") or ""),
+            str(document.get("artist") or ""),
+        )
+        await self._attach_embedding(document, admin_user_id)
+        await self.songs.upsert_song(document, replace_existing=True)
+
+    async def _find_existing_song(self, normalized: dict[str, Any]) -> dict[str, Any] | None:
+        if hasattr(self.songs, "find_existing_song"):
+            return await self.songs.find_existing_song(
+                song_id=normalized.get("song_id"),
+                title=normalized["title"],
+                artist=normalized["artist"],
+            )
+        return await self.songs.find_by_song_id(normalized["song_id"])
+
+    def _has_existing_embedding(self, existing: dict[str, Any] | None) -> bool:
+        if not existing:
+            return False
+        return existing.get("embedding") is not None
+
+    def _can_regenerate_embedding(self, requested: bool) -> bool:
+        return bool(requested and self.settings.allow_embedding_regeneration)
 
     def _csv_track_document(self, row: dict[str, str]) -> dict[str, Any]:
         title = self._cell(row, "title")
@@ -296,6 +374,16 @@ class SpotifyIngestionService:
     def _slug(title: str, artist: str) -> str:
         value = re.sub(r"[^a-z0-9]+", "-", f"{title}-{artist}".lower()).strip("-")
         return value or "song"
+
+    def _dedupe_key(self, normalized: dict[str, Any]) -> str:
+        return normalized.get("song_id") or self._normalized_key(
+            normalized.get("title") or "",
+            normalized.get("artist") or "",
+        )
+
+    @classmethod
+    def _normalized_key(cls, title: str, artist: str) -> str:
+        return cls._slug(title, artist)
 
     async def _start_job(
         self,

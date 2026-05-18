@@ -14,7 +14,22 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_vision_model: str = "gpt-5.4-mini"
     openai_ingestion_model: str = "gpt-5.4-mini"
-    openai_embedding_model: str = "text-embedding-3-small"
+
+    ai_provider: str = "openai"
+    embedding_provider: str = "openai"
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        validation_alias=AliasChoices("EMBEDDING_MODEL", "OPENAI_EMBEDDING_MODEL"),
+    )
+    embedding_dimension: int = 768
+    max_runtime_embedding_calls_per_analyze: int = 1
+    enable_song_embedding_in_runtime: bool = False
+    allow_embedding_regeneration: bool = False
+
+    gemini_api_key: str = ""
+    gemini_vision_model: str = "gemini-2.5-flash"
+    gemini_ingestion_model: str = "gemini-2.5-flash"
+    gemini_embedding_model: str = "gemini-embedding-001"
 
     supabase_db_url: str = Field(
         default="",
@@ -42,6 +57,14 @@ class Settings(BaseSettings):
     @property
     def has_openai(self) -> bool:
         return bool(self.openai_api_key)
+
+    @property
+    def has_gemini(self) -> bool:
+        return bool(self.gemini_api_key)
+
+    @property
+    def openai_embedding_model(self) -> str:
+        return self.embedding_model
 
     @property
     def has_pgvector(self) -> bool:

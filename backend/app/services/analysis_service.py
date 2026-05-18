@@ -1,5 +1,6 @@
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
 from ..models import (
@@ -12,22 +13,47 @@ from ..models import (
 )
 from ..repositories.pgvector import SupabaseVectorSongRepository
 from ..repositories.supabase import SupabaseRepository
+from ..repositories.usage_repository import EmbeddingUsageRepository
+from ..config import Settings
+from ..errors import AppError
+from .embedding_service import EmbeddingService
 from .openai_service import OpenAIVibeService
 from .reranker import SongReranker
+
+
+@dataclass
+class _RuntimeEmbeddingBudget:
+    max_calls: int
+    calls: int = 0
+
+    def consume(self) -> None:
+        self.calls += 1
+        if self.calls > self.max_calls:
+            raise AppError(
+                "RUNTIME_EMBEDDING_LIMIT_EXCEEDED",
+                "Runtime /analyze attempted too many embedding calls.",
+                status_code=500,
+            )
 
 
 class AnalysisService:
     def __init__(
         self,
         openai: OpenAIVibeService,
+        embeddings: EmbeddingService,
         songs: SupabaseVectorSongRepository,
         supabase: SupabaseRepository,
         reranker: SongReranker,
+        usage: EmbeddingUsageRepository,
+        settings: Settings,
     ) -> None:
         self.openai = openai
+        self.embeddings = embeddings
         self.songs = songs
         self.supabase = supabase
         self.reranker = reranker
+        self.usage = usage
+        self.settings = settings
 
     async def analyze(
         self,
@@ -50,7 +76,14 @@ class AnalysisService:
             analysis_mode=analysis_mode.value,
             preferences=preferences,
         )
-        query_embedding = await self.openai.embed_text(vibe.playlist_query)
+        embedding_budget = _RuntimeEmbeddingBudget(
+            max_calls=self.settings.max_runtime_embedding_calls_per_analyze
+        )
+        query_embedding = await self._embed_runtime_playlist_query(
+            vibe.playlist_query,
+            user_id=user_id,
+            budget=embedding_budget,
+        )
         candidates = await self.songs.search(
             vibe.playlist_query,
             embedding=query_embedding,
@@ -89,6 +122,29 @@ class AnalysisService:
         if save_result:
             await self._save_result(result, user_id)
         return result
+
+    async def _embed_runtime_playlist_query(
+        self,
+        playlist_query: str,
+        user_id: str | None,
+        budget: _RuntimeEmbeddingBudget,
+    ) -> list[float]:
+        if budget.max_calls < 1:
+            raise AppError(
+                "RUNTIME_EMBEDDING_LIMIT_EXCEEDED",
+                "Runtime embedding budget does not allow playlist query embedding.",
+                status_code=500,
+            )
+        budget.consume()
+        embedding = await self.embeddings.embed_text(playlist_query)
+        await self.usage.log_embedding_call(
+            operation="embedding",
+            context="runtime_playlist_query",
+            model=getattr(self.embeddings, "model", self.settings.embedding_model),
+            input_text_count=1,
+            user_id=user_id,
+        )
+        return embedding
 
     async def _load_preferences(
         self,

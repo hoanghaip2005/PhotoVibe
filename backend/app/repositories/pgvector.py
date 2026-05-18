@@ -49,33 +49,12 @@ class SupabaseVectorSongRepository:
         del query
         vector = self._vector_literal(embedding)
         query_sql = """
-            select
-              song_id,
-              title,
-              artist,
-              spotify_url,
-              spotify_search_url,
-              album,
-              genres,
-              mood_tags,
-              scene_tags,
-              era_tags,
-              language,
-              energy_level,
-              valence_level,
-              age_affinity,
-              popularity_tier,
-              vibe_description,
-              explicit,
-              greatest(0, 1 - (embedding <=> %s::vector)) as vector_similarity
-            from songs
-            where embedding is not null
-            order by embedding <=> %s::vector
-            limit %s
+            select *
+            from match_songs(%s::vector, %s)
         """
         with self._connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(query_sql, (vector, vector, limit))
+                cursor.execute(query_sql, (vector, limit))
                 documents = cursor.fetchall()
         return [self._candidate_from_document(dict(doc)) for doc in documents]
 
@@ -88,7 +67,11 @@ class SupabaseVectorSongRepository:
         replace_existing: bool = False,
     ) -> bool:
         self._ensure_configured()
-        existing = self._find_by_song_id_sync(document["song_id"])
+        existing = self._find_existing_song_sync(
+            song_id=document.get("song_id"),
+            title=document.get("title") or "",
+            artist=document.get("artist") or "",
+        )
         if existing and not replace_existing:
             return False
 
@@ -102,7 +85,7 @@ class SupabaseVectorSongRepository:
         ]
         statement = sql.SQL(
             "insert into songs ({columns}) values ({placeholders}) "
-            "on conflict (song_id) do update set {assignments}"
+            "on conflict (normalized_key) do update set {assignments}"
         ).format(
             columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
             placeholders=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
@@ -132,15 +115,65 @@ class SupabaseVectorSongRepository:
                 row = cursor.fetchone()
         return dict(row) if row else None
 
+    async def find_existing_song(
+        self,
+        *,
+        song_id: str | None,
+        title: str,
+        artist: str,
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._find_existing_song_sync,
+            song_id,
+            title,
+            artist,
+        )
+
+    def _find_existing_song_sync(
+        self,
+        song_id: str | None,
+        title: str,
+        artist: str,
+    ) -> dict[str, Any] | None:
+        self._ensure_configured()
+        normalized_key = self.normalized_key(title, artist)
+        with self._connection() as connection:
+            with connection.cursor() as cursor:
+                if song_id:
+                    cursor.execute(
+                        """
+                        select *
+                        from songs
+                        where song_id = %s or normalized_key = %s
+                        limit 1
+                        """,
+                        (song_id, normalized_key),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        select *
+                        from songs
+                        where normalized_key = %s
+                        limit 1
+                        """,
+                        (normalized_key,),
+                    )
+                row = cursor.fetchone()
+        return dict(row) if row else None
+
     def _song_payload(self, document: dict[str, Any]) -> dict[str, Any]:
+        title = document.get("title") or "Unknown"
+        artist = document.get("artist") or "Unknown"
         return {
-            "song_id": document["song_id"],
+            "song_id": document.get("song_id"),
             "track_id": document.get("track_id"),
-            "title": document.get("title") or "Unknown",
-            "artist": document.get("artist") or "Unknown",
+            "title": title,
+            "artist": artist,
+            "normalized_key": document.get("normalized_key") or self.normalized_key(title, artist),
             "spotify_url": document.get("spotify_url"),
             "spotify_search_url": document.get("spotify_search_url")
-            or self.spotify_search_url(document.get("title") or "", document.get("artist") or ""),
+            or self.spotify_search_url(title, artist),
             "album": document.get("album"),
             "artwork": document.get("artwork"),
             "duration_ms": document.get("duration_ms"),
@@ -156,7 +189,12 @@ class SupabaseVectorSongRepository:
             "popularity_tier": document.get("popularity_tier") or "unknown",
             "vibe_description": document.get("vibe_description") or document.get("$vectorize") or "",
             "embedding": self._vector_literal(document["embedding"]),
+            "embedding_model": document.get("embedding_model") or self.settings.embedding_model,
+            "embedding_created_at": document.get("embedding_created_at")
+            or datetime.now(UTC).isoformat(),
+            "source": document.get("source") or "spotify_ingestion",
             "ingested_at": document.get("ingested_at") or datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
 
     def _candidate_from_document(self, doc: dict[str, Any]) -> SongCandidate:
@@ -178,7 +216,7 @@ class SupabaseVectorSongRepository:
             age_affinity=doc.get("age_affinity") or self._neutral_age_affinity(),
             popularity_tier=str(doc.get("popularity_tier") or "unknown"),
             vibe_description=str(doc.get("vibe_description") or ""),
-            vector_similarity=float(doc.get("vector_similarity") or 0),
+            vector_similarity=float(doc.get("similarity") or doc.get("vector_similarity") or 0),
             explicit=bool(doc.get("explicit") or False),
         )
 
@@ -205,3 +243,10 @@ class SupabaseVectorSongRepository:
     @staticmethod
     def spotify_search_url(title: str, artist: str) -> str:
         return "https://open.spotify.com/search/" + quote(f"{title} {artist}".strip())
+
+    @staticmethod
+    def normalized_key(title: str, artist: str) -> str:
+        value = f"{title}-{artist}".lower()
+        value = "".join(character if character.isalnum() else "-" for character in value)
+        normalized = "-".join(part for part in value.split("-") if part)
+        return normalized or "song"
